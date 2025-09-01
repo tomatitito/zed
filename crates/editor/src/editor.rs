@@ -960,6 +960,14 @@ struct InlineBlamePopover {
     keyboard_grace: bool,
 }
 
+struct DefinitionPopoverState {
+    position: gpui::Point<Pixels>,
+    hide_task: Option<Task<()>>,
+    popover_bounds: Option<Bounds<Pixels>>,
+    definition_editor: Entity<Editor>,
+    definition_location: LocationLink,
+}
+
 enum SelectionDragState {
     /// State when no drag related activity is detected.
     None,
@@ -1178,6 +1186,7 @@ pub struct Editor {
     next_color_inlay_id: usize,
     colors: Option<LspColorData>,
     folding_newlines: Task<()>,
+    definition_popover: Option<DefinitionPopoverState>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -2256,6 +2265,7 @@ impl Editor {
             mode,
             selection_drag_state: SelectionDragState::None,
             folding_newlines: Task::ready(()),
+            definition_popover: None,
         };
 
         if is_minimap {
@@ -3915,6 +3925,11 @@ impl Editor {
         }
 
         if self.mouse_context_menu.take().is_some() {
+            return true;
+        }
+
+        if self.definition_popover.take().is_some() {
+            cx.notify();
             return true;
         }
 
@@ -15752,6 +15767,127 @@ impl Editor {
                 .await?;
             anyhow::Ok(navigated)
         })
+    }
+
+    pub fn go_to_definition_popover(
+        &mut self,
+        _: &GoToDefinitionPopover,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_quick_definition(window, cx);
+    }
+
+    fn show_quick_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Hide any existing popover
+        self.hide_definition_popover(cx);
+
+        let Some(provider) = self.semantics_provider.clone() else {
+            return;
+        };
+
+        let head = self.selections.newest::<usize>(cx).head();
+        let buffer = self.buffer.read(cx);
+        let Some((buffer_anchor, head)) = buffer.text_anchor_for_position(head, cx) else {
+            return;
+        };
+
+        let buffer_snapshot = buffer.snapshot(cx);
+        let language = buffer_snapshot.language_at(head);
+
+        // Get the display point for positioning the popover
+        let display_point = self.display_map.read(cx).buffer_to_display_point(head, cx);
+        let position = self.pixel_position_of_cursor(display_point, window, cx);
+
+        cx.spawn(|editor, mut cx| async move {
+            let definitions = provider
+                .definitions(&buffer_anchor, head, GotoDefinitionKind::Symbol, &mut cx)
+                .await?
+                .unwrap_or_default();
+
+            if definitions.is_empty() {
+                return;
+            }
+
+            // Use the first definition
+            let definition = &definitions[0];
+
+            // Open the file and create an editor for it
+            if let Some(project) = editor.read_with(&cx, |editor, _| editor.project.clone())? {
+                let definition_buffer = project
+                    .update(&mut cx, |project, cx| {
+                        project.open_buffer(definition.target_uri.clone(), cx)
+                    })?
+                    .await?;
+
+                editor
+                    .update_in(&mut cx, |editor, window, cx| {
+                        // Create a read-only editor for the definition
+                        let definition_editor = cx.new(|cx| {
+                            let mut editor =
+                                Editor::for_buffer(definition_buffer, Some(project), window, cx);
+                            editor.set_read_only(true);
+
+                            // Set the selection to the definition range if available
+                            if let Some(target_range) = definition.target_selection_range {
+                                editor.change_selections(
+                                    SelectionEffects::scroll(Autoscroll::center()),
+                                    window,
+                                    cx,
+                                    |s| {
+                                        s.select_ranges([target_range]);
+                                    },
+                                );
+                                // Request autoscroll to show the definition
+                                editor.request_autoscroll(Autoscroll::center(), cx);
+                            }
+
+                            editor
+                        });
+
+                        // Store the popover state
+                        editor.definition_popover = Some(DefinitionPopoverState {
+                            position,
+                            hide_task: None,
+                            popover_bounds: None,
+                            definition_editor,
+                            definition_location: definition.clone(),
+                        });
+
+                        cx.notify();
+                    })
+                    .ok();
+            }
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn hide_definition_popover(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut state) = self.definition_popover.take() {
+            if let Some(task) = state.hide_task.take() {
+                task.cancel();
+            }
+            cx.notify();
+        }
+    }
+
+    fn pixel_position_of_cursor(
+        &self,
+        display_point: DisplayPoint,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Point<Pixels> {
+        let line_height = window.line_height();
+        let em_width = window.em_width();
+        let position = self.scroll_manager.anchor();
+        let scroll_position = position.offset;
+
+        let row_pixels = (display_point.row().0 as f32 - scroll_position.y) * line_height;
+        let col_pixels = display_point.column() as f32 * em_width * 0.6; // Approximate character width
+
+        gpui::Point::new(col_pixels, row_pixels + line_height)
     }
 
     pub fn open_url(&mut self, _: &OpenUrl, window: &mut Window, cx: &mut Context<Self>) {

@@ -417,6 +417,7 @@ impl EditorElement {
                 .go_to_type_definition_split(action, window, cx)
                 .detach_and_log_err(cx);
         });
+        register_action(editor, window, Editor::go_to_definition_popover);
         register_action(editor, window, Editor::open_url);
         register_action(editor, window, Editor::open_selected_filename);
         register_action(editor, window, Editor::fold);
@@ -8495,6 +8496,7 @@ impl Element for EditorElement {
                                     blame.blame_for_rows(&[row_infos], cx).next()
                                 })
                                 .flatten()?;
+
                             let mut element = render_inline_blame_entry(blame_entry, &style, cx)?;
                             let inline_blame_padding = ProjectSettings::get_global(cx)
                                 .git
@@ -9159,9 +9161,64 @@ impl Element for EditorElement {
                     self.paint_scrollbars(layout, window, cx);
                     self.paint_edit_prediction_popover(layout, window, cx);
                     self.paint_mouse_context_menu(layout, window, cx);
+                    self.paint_definition_popover(layout, window, cx);
                 });
             })
         })
+    }
+
+    fn paint_definition_popover(
+        &mut self,
+        layout: &EditorLayout,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(definition_state) = self.editor.read(cx).definition_popover.as_ref() {
+            let definition_editor_clone = definition_state.definition_editor.clone();
+            let editor_element = EditorElement::new(&definition_editor_clone, self.style.clone());
+
+            // Create a container for the definition popover
+            let mut element = div()
+                .bg(cx.theme().colors().editor_background)
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .rounded_md()
+                .shadow_lg()
+                .max_w(px(800.))
+                .max_h(px(400.))
+                .overflow_hidden()
+                .child(editor_element)
+                .into_any();
+
+            let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+            let overall_height = size.height + HOVER_POPOVER_GAP;
+            let line_height = layout.position_map.line_height;
+
+            // Position the popover above or below the cursor
+            let popover_origin = if definition_state.position.y > overall_height {
+                point(
+                    definition_state.position.x,
+                    definition_state.position.y - size.height - HOVER_POPOVER_GAP,
+                )
+            } else {
+                point(
+                    definition_state.position.x,
+                    definition_state.position.y + line_height + HOVER_POPOVER_GAP,
+                )
+            };
+
+            let popover_bounds = Bounds::new(popover_origin, size);
+
+            // Update the popover bounds in the editor state
+            self.editor.update(cx, |editor, _| {
+                if let Some(state) = &mut editor.definition_popover {
+                    state.popover_bounds = Some(popover_bounds);
+                }
+            });
+
+            element.prepaint_as_root(popover_origin, AvailableSpace::min_size(), window, cx);
+            window.defer_draw(element, popover_origin, 2);
+        }
     }
 }
 
