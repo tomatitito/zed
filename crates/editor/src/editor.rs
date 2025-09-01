@@ -960,6 +960,14 @@ struct InlineBlamePopover {
     keyboard_grace: bool,
 }
 
+struct DefinitionPopoverState {
+    position: gpui::Point<Pixels>,
+    hide_task: Option<Task<()>>,
+    popover_bounds: Option<Bounds<Pixels>>,
+    definition_editor: Entity<Editor>,
+    definition_location: LocationLink,
+}
+
 enum SelectionDragState {
     /// State when no drag related activity is detected.
     None,
@@ -1178,6 +1186,7 @@ pub struct Editor {
     next_color_inlay_id: usize,
     colors: Option<LspColorData>,
     folding_newlines: Task<()>,
+    definition_popover: Option<DefinitionPopoverState>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -2256,6 +2265,7 @@ impl Editor {
             mode,
             selection_drag_state: SelectionDragState::None,
             folding_newlines: Task::ready(()),
+            definition_popover: None,
         };
 
         if is_minimap {
@@ -2588,7 +2598,7 @@ impl Editor {
                 || binding
                     .keystrokes()
                     .first()
-                    .is_some_and(|keystroke| keystroke.modifiers.modified())
+                    .is_some_and(|keystroke| keystroke.display_modifiers.modified())
         }))
     }
 
@@ -3915,6 +3925,11 @@ impl Editor {
         }
 
         if self.mouse_context_menu.take().is_some() {
+            return true;
+        }
+
+        if self.definition_popover.take().is_some() {
+            cx.notify();
             return true;
         }
 
@@ -7686,16 +7701,16 @@ impl Editor {
             .keystroke()
         {
             modifiers_held = modifiers_held
-                || (&accept_keystroke.modifiers == modifiers
-                    && accept_keystroke.modifiers.modified());
+                || (&accept_keystroke.display_modifiers == modifiers
+                    && accept_keystroke.display_modifiers.modified());
         };
         if let Some(accept_partial_keystroke) = self
             .accept_edit_prediction_keybind(true, window, cx)
             .keystroke()
         {
             modifiers_held = modifiers_held
-                || (&accept_partial_keystroke.modifiers == modifiers
-                    && accept_partial_keystroke.modifiers.modified());
+                || (&accept_partial_keystroke.display_modifiers == modifiers
+                    && accept_partial_keystroke.display_modifiers.modified());
         }
 
         if modifiers_held {
@@ -9044,7 +9059,7 @@ impl Editor {
 
         let is_platform_style_mac = PlatformStyle::platform() == PlatformStyle::Mac;
 
-        let modifiers_color = if accept_keystroke.modifiers == window.modifiers() {
+        let modifiers_color = if accept_keystroke.display_modifiers == window.modifiers() {
             Color::Accent
         } else {
             Color::Muted
@@ -9056,19 +9071,19 @@ impl Editor {
             .font(theme::ThemeSettings::get_global(cx).buffer_font.clone())
             .text_size(TextSize::XSmall.rems(cx))
             .child(h_flex().children(ui::render_modifiers(
-                &accept_keystroke.modifiers,
+                &accept_keystroke.display_modifiers,
                 PlatformStyle::platform(),
                 Some(modifiers_color),
                 Some(IconSize::XSmall.rems().into()),
                 true,
             )))
             .when(is_platform_style_mac, |parent| {
-                parent.child(accept_keystroke.key.clone())
+                parent.child(accept_keystroke.display_key.clone())
             })
             .when(!is_platform_style_mac, |parent| {
                 parent.child(
                     Key::new(
-                        util::capitalize(&accept_keystroke.key),
+                        util::capitalize(&accept_keystroke.display_key),
                         Some(Color::Default),
                     )
                     .size(Some(IconSize::XSmall.rems().into())),
@@ -9171,7 +9186,7 @@ impl Editor {
         max_width: Pixels,
         cursor_point: Point,
         style: &EditorStyle,
-        accept_keystroke: Option<&gpui::Keystroke>,
+        accept_keystroke: Option<&gpui::KeybindingKeystroke>,
         _window: &Window,
         cx: &mut Context<Editor>,
     ) -> Option<AnyElement> {
@@ -9249,7 +9264,7 @@ impl Editor {
                                         accept_keystroke.as_ref(),
                                         |el, accept_keystroke| {
                                             el.child(h_flex().children(ui::render_modifiers(
-                                                &accept_keystroke.modifiers,
+                                                &accept_keystroke.display_modifiers,
                                                 PlatformStyle::platform(),
                                                 Some(Color::Default),
                                                 Some(IconSize::XSmall.rems().into()),
@@ -9319,7 +9334,7 @@ impl Editor {
                         .child(completion),
                 )
                 .when_some(accept_keystroke, |el, accept_keystroke| {
-                    if !accept_keystroke.modifiers.modified() {
+                    if !accept_keystroke.display_modifiers.modified() {
                         return el;
                     }
 
@@ -9338,7 +9353,7 @@ impl Editor {
                                     .font(theme::ThemeSettings::get_global(cx).buffer_font.clone())
                                     .when(is_platform_style_mac, |parent| parent.gap_1())
                                     .child(h_flex().children(ui::render_modifiers(
-                                        &accept_keystroke.modifiers,
+                                        &accept_keystroke.display_modifiers,
                                         PlatformStyle::platform(),
                                         Some(if !has_completion {
                                             Color::Muted
@@ -15754,6 +15769,127 @@ impl Editor {
         })
     }
 
+    pub fn go_to_definition_popover(
+        &mut self,
+        _: &GoToDefinitionPopover,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_quick_definition(window, cx);
+    }
+
+    fn show_quick_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Hide any existing popover
+        self.hide_definition_popover(cx);
+
+        let Some(provider) = self.semantics_provider.clone() else {
+            return;
+        };
+
+        let head = self.selections.newest::<usize>(cx).head();
+        let buffer = self.buffer.read(cx);
+        let Some((buffer_anchor, head)) = buffer.text_anchor_for_position(head, cx) else {
+            return;
+        };
+
+        let buffer_snapshot = buffer.snapshot(cx);
+        let language = buffer_snapshot.language_at(head);
+
+        // Get the display point for positioning the popover
+        let display_point = self.display_map.read(cx).buffer_to_display_point(head, cx);
+        let position = self.pixel_position_of_cursor(display_point, window, cx);
+
+        cx.spawn(|editor, mut cx| async move {
+            let definitions = provider
+                .definitions(&buffer_anchor, head, GotoDefinitionKind::Symbol, &mut cx)
+                .await?
+                .unwrap_or_default();
+
+            if definitions.is_empty() {
+                return;
+            }
+
+            // Use the first definition
+            let definition = &definitions[0];
+
+            // Open the file and create an editor for it
+            if let Some(project) = editor.read_with(&cx, |editor, _| editor.project.clone())? {
+                let definition_buffer = project
+                    .update(&mut cx, |project, cx| {
+                        project.open_buffer(definition.target_uri.clone(), cx)
+                    })?
+                    .await?;
+
+                editor
+                    .update_in(&mut cx, |editor, window, cx| {
+                        // Create a read-only editor for the definition
+                        let definition_editor = cx.new(|cx| {
+                            let mut editor =
+                                Editor::for_buffer(definition_buffer, Some(project), window, cx);
+                            editor.set_read_only(true);
+
+                            // Set the selection to the definition range if available
+                            if let Some(target_range) = definition.target_selection_range {
+                                editor.change_selections(
+                                    SelectionEffects::scroll(Autoscroll::center()),
+                                    window,
+                                    cx,
+                                    |s| {
+                                        s.select_ranges([target_range]);
+                                    },
+                                );
+                                // Request autoscroll to show the definition
+                                editor.request_autoscroll(Autoscroll::center(), cx);
+                            }
+
+                            editor
+                        });
+
+                        // Store the popover state
+                        editor.definition_popover = Some(DefinitionPopoverState {
+                            position,
+                            hide_task: None,
+                            popover_bounds: None,
+                            definition_editor,
+                            definition_location: definition.clone(),
+                        });
+
+                        cx.notify();
+                    })
+                    .ok();
+            }
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn hide_definition_popover(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut state) = self.definition_popover.take() {
+            if let Some(task) = state.hide_task.take() {
+                task.cancel();
+            }
+            cx.notify();
+        }
+    }
+
+    fn pixel_position_of_cursor(
+        &self,
+        display_point: DisplayPoint,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Point<Pixels> {
+        let line_height = window.line_height();
+        let em_width = window.em_width();
+        let position = self.scroll_manager.anchor();
+        let scroll_position = position.offset;
+
+        let row_pixels = (display_point.row().0 as f32 - scroll_position.y) * line_height;
+        let col_pixels = display_point.column() as f32 * em_width * 0.6; // Approximate character width
+
+        gpui::Point::new(col_pixels, row_pixels + line_height)
+    }
+
     pub fn open_url(&mut self, _: &OpenUrl, window: &mut Window, cx: &mut Context<Self>) {
         let selection = self.selections.newest_anchor();
         let head = selection.head();
@@ -20074,7 +20210,7 @@ impl Editor {
                 let (telemetry, is_via_ssh) = {
                     let project = project.read(cx);
                     let telemetry = project.client().telemetry().clone();
-                    let is_via_ssh = project.is_via_ssh();
+                    let is_via_ssh = project.is_via_remote_server();
                     (telemetry, is_via_ssh)
                 };
                 refresh_linked_ranges(self, window, cx);
@@ -20642,7 +20778,7 @@ impl Editor {
                 copilot_enabled,
                 copilot_enabled_for_language,
                 edit_predictions_provider,
-                is_via_ssh = project.is_via_ssh(),
+                is_via_ssh = project.is_via_remote_server(),
             );
         } else {
             telemetry::event!(
@@ -20652,7 +20788,7 @@ impl Editor {
                 copilot_enabled,
                 copilot_enabled_for_language,
                 edit_predictions_provider,
-                is_via_ssh = project.is_via_ssh(),
+                is_via_ssh = project.is_via_remote_server(),
             );
         };
     }

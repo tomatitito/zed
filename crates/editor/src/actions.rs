@@ -465,6 +465,8 @@ actions!(
         GoToDeclarationSplit,
         /// Goes to the definition of the symbol at cursor.
         GoToDefinition,
+        /// Shows the definition of the symbol at cursor in a popover.
+        GoToDefinitionPopover,
         /// Goes to definition in a split pane.
         GoToDefinitionSplit,
         /// Goes to the next diff hunk.
