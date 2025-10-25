@@ -99,6 +99,29 @@ impl Workspace {
                 }
             })
             .detach();
+
+            if let Ok(prompt) =
+                AnyEntity::from(notification.clone()).downcast::<LanguageServerPrompt>()
+            {
+                if prompt
+                    .read(cx)
+                    .request
+                    .as_ref()
+                    .map_or(false, |r| r.actions.is_empty())
+                {
+                    cx.spawn({
+                        let id = id.clone();
+                        async move |this, cx| {
+                            cx.background_executor().timer(Duration::from_secs(5)).await;
+                            this.update(cx, |workspace, cx| {
+                                workspace.dismiss_notification(&id, cx);
+                            })
+                            .ok()
+                        }
+                    })
+                    .detach();
+                }
+            }
             notification.into()
         });
     }
