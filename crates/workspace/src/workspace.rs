@@ -1331,7 +1331,7 @@ impl Workspace {
                     struct LanguageServerPrompt;
 
                     this.show_notification(
-                        NotificationId::composite::<LanguageServerPrompt>(request.id as usize),
+                        NotificationId::composite::<LanguageServerPrompt>(request.id),
                         cx,
                         |cx| {
                             cx.new(|cx| {
