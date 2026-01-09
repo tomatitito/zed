@@ -1,24 +1,21 @@
 use crate::{SuppressNotification, Toast, Workspace};
 use anyhow::Context as _;
 use gpui::{
-    AnyView, App, AppContext as _, AsyncWindowContext, ClickEvent, Context, DismissEvent, Entity,
-    EventEmitter, FocusHandle, Focusable, PromptLevel, Render, ScrollHandle, Task,
-    TextStyleRefinement, UnderlineStyle, svg,
+    AnyEntity, AnyView, App, AppContext as _, AsyncWindowContext, ClickEvent, Context,
+    DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel, Render, ScrollHandle,
+    Task, TextStyleRefinement, UnderlineStyle, svg,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use parking_lot::Mutex;
+use project::project_settings::ProjectSettings;
 use settings::Settings;
 use theme::ThemeSettings;
-use project::project_settings::ProjectSettings;
-use settings::{NotificationAutoDismissalSetting, Settings};
 
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 use std::{any::TypeId, time::Duration};
 use ui::{CopyButton, Tooltip, prelude::*};
 use util::ResultExt;
-
-const NOTIFICATION_AUTO_DISMISS_DURATION_MILLIS: u64 = 5000;
 
 #[derive(Default)]
 pub struct Notifications {
@@ -113,34 +110,28 @@ impl Workspace {
                     .as_ref()
                     .is_some_and(|request| request.actions.is_empty());
 
-                let auto_dismiss_setting = ProjectSettings::get_global(cx)
+                let dismiss_timeout_ms = ProjectSettings::get_global(cx)
                     .global_lsp_settings
                     .notifications
-                    .auto_dismiss;
+                    .dismiss_timeout_ms;
 
-                let should_auto_dismiss =
-                    auto_dismiss_setting != NotificationAutoDismissalSetting::Never;
-
-                if is_prompt_without_actions && should_auto_dismiss {
-                    let dismiss_duration_ms = match auto_dismiss_setting {
-                        NotificationAutoDismissalSetting::After(duration_ms) => duration_ms,
-                        _ => NOTIFICATION_AUTO_DISMISS_DURATION_MILLIS,
-                    };
-
-                    let task = cx.spawn({
-                        let id = id.clone();
-                        async move |this, cx| {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(dismiss_duration_ms))
-                                .await;
-                            let _ = this.update(cx, |workspace, cx| {
-                                workspace.dismiss_notification(&id, cx);
-                            });
-                        }
-                    });
-                    prompt.update(cx, |prompt, _| {
-                        prompt.dismiss_task = Some(task);
-                    });
+                if is_prompt_without_actions {
+                    if let Some(dismiss_duration_ms) = dismiss_timeout_ms.filter(|&ms| ms > 0) {
+                        let task = cx.spawn({
+                            let id = id.clone();
+                            async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(dismiss_duration_ms))
+                                    .await;
+                                let _ = this.update(cx, |workspace, cx| {
+                                    workspace.dismiss_notification(&id, cx);
+                                });
+                            }
+                        });
+                        prompt.update(cx, |prompt, _| {
+                            prompt.dismiss_task = Some(task);
+                        });
+                    }
                 }
             }
             notification.into()
@@ -218,9 +209,7 @@ impl Workspace {
         if toast.autohide {
             cx.spawn(async move |workspace, cx| {
                 cx.background_executor()
-                    .timer(Duration::from_millis(
-                        NOTIFICATION_AUTO_DISMISS_DURATION_MILLIS,
-                    ))
+                    .timer(Duration::from_millis(5000))
                     .await;
                 workspace
                     .update(cx, |workspace, cx| workspace.dismiss_toast(&toast.id, cx))
@@ -303,7 +292,7 @@ impl LanguageServerPrompt {
 
             this.update(cx, |this, cx| {
                 this.dismiss_notification(cx);
-            })?;
+            });
 
             anyhow::Ok(())
         })
@@ -1332,13 +1321,15 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_notification_auto_dismiss_with_never_setting(cx: &mut TestAppContext) {
+    async fn test_notification_auto_dismiss_turned_off(cx: &mut TestAppContext) {
         init_test(cx);
 
         cx.update(|cx| {
             let mut settings = ProjectSettings::get_global(cx).clone();
-            settings.global_lsp_settings.notifications.auto_dismiss =
-                NotificationAutoDismissalSetting::Never;
+            settings
+                .global_lsp_settings
+                .notifications
+                .dismiss_timeout_ms = Some(0);
             ProjectSettings::override_global(settings, cx);
         });
 
@@ -1378,8 +1369,10 @@ mod tests {
         let custom_duration_ms: u64 = 2000;
         cx.update(|cx| {
             let mut settings = ProjectSettings::get_global(cx).clone();
-            settings.global_lsp_settings.notifications.auto_dismiss =
-                NotificationAutoDismissalSetting::After(custom_duration_ms);
+            settings
+                .global_lsp_settings
+                .notifications
+                .dismiss_timeout_ms = Some(custom_duration_ms);
             ProjectSettings::override_global(settings, cx);
         });
 

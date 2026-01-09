@@ -2253,8 +2253,9 @@
     // Whether to show the LSP servers button in the status bar.
     "button": true,
     "notifications": {
-      // Whether to automatically dismiss language server notifications.
-      "auto_dismiss": "always"
+      // Timeout in milliseconds for automatically dismissing language server notifications.
+      // Set to 0 to disable auto-dismiss.
+      "dismiss_timeout_ms": 5000
     }
   },
   // Jupyter settings
