@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, sync::Arc, sync::LazyLock};
 
 use collections::HashMap;
 use futures::{StreamExt, channel::mpsc};
@@ -15,6 +15,23 @@ use crate::{LanguageServerLogType, LspStore, Project, ProjectItem as _};
 const SEND_LINE: &str = "\n// Send:";
 const RECEIVE_LINE: &str = "\n// Receive:";
 const MAX_STORED_LOG_ENTRIES: usize = 2000;
+
+static LSP_TRACE_FILTER: LazyLock<Option<Vec<String>>> = LazyLock::new(|| {
+    std::env::var("ZED_LSP_TRACE").ok().map(|val| {
+        val.split(',').map(|s| s.trim().to_lowercase()).collect()
+    })
+});
+
+fn should_trace_lsp_rpc(server_name: Option<&LanguageServerName>) -> bool {
+    let Some(filter) = LSP_TRACE_FILTER.as_ref() else {
+        return false;
+    };
+    let Some(name) = server_name else {
+        return false;
+    };
+    let name_lower = name.0.to_lowercase();
+    filter.iter().any(|f| f == "*" || f == &name_lower)
+}
 
 pub fn init(on_headless_host: bool, cx: &mut App) -> Entity<LogStore> {
     let log_store = cx.new(|cx| LogStore::new(on_headless_host, cx));
@@ -417,6 +434,17 @@ impl LogStore {
         let store_logs = !self.on_headless_host;
         let language_server_state = self.get_language_server_state(id)?;
 
+        let server_name = language_server_state
+            .name
+            .as_ref()
+            .map(|n| n.0.as_ref())
+            .unwrap_or("unknown");
+        match typ {
+            MessageType::ERROR => log::error!("[lsp:{server_name}] {message}"),
+            MessageType::WARNING => log::warn!("[lsp:{server_name}] {message}"),
+            _ => log::info!("[lsp:{server_name}] {message}"),
+        };
+
         let log_lines = &mut language_server_state.log_messages;
         let message = message.trim_end().to_string();
         if !store_logs {
@@ -455,6 +483,13 @@ impl LogStore {
     ) -> Option<()> {
         let store_logs = !self.on_headless_host;
         let language_server_state = self.get_language_server_state(id)?;
+
+        let server_name = language_server_state
+            .name
+            .as_ref()
+            .map(|n| n.0.as_ref())
+            .unwrap_or("unknown");
+        log::debug!("[lsp:{server_name}] trace: {message}");
 
         let log_lines = &mut language_server_state.trace_messages;
         if !store_logs {
@@ -641,6 +676,20 @@ impl LogStore {
         message: &str,
         cx: &mut Context<Self>,
     ) -> Option<()> {
+        let server_name = self
+            .language_servers
+            .get(&language_server_id)
+            .and_then(|s| s.name.as_ref());
+        if should_trace_lsp_rpc(server_name) {
+            let name = server_name.map(|n| n.0.as_ref()).unwrap_or("unknown");
+            match io_kind {
+                IoKind::StdIn => log::info!("[lsp:{name}] -> {message}"),
+                IoKind::StdOut => log::info!("[lsp:{name}] <- {message}"),
+                IoKind::StdErr => {} // handled by add_language_server_log below
+            }
+            self.enable_rpc_trace_for_language_server(language_server_id);
+        }
+
         let is_received = match io_kind {
             IoKind::StdOut => true,
             IoKind::StdIn => false,
