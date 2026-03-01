@@ -2010,7 +2010,7 @@
       "language_servers": ["!ruby-lsp", "..."],
     },
     "Kotlin": {
-      "language_servers": ["!kotlin-language-server", "kotlin-lsp", "..."],
+      "language_servers": ["!kotlin-language-server", "!kotlin-lsp", "kotlin-analyzer", "..."],
     },
     "LaTeX": {
       "formatter": "language_server",
